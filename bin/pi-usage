@@ -380,7 +380,7 @@ def _save_shards(cache, rel_dirs):
             pass  # cache is optional — a blessing, not a curse
 
 
-def scan():
+def scan(cache=None, persist=True):
     """Aggregate across all JSONL sessions; returns
     (max_day, by_day, by_model, by_provider, by_project, by_session,
     by_day_model).
@@ -390,14 +390,18 @@ def scan():
     pre-aggregated parts are reused directly. The cache is sharded per
     relative directory, so a change rewrites only that project's shard and
     survives multiple processes — `pi-usage-herdr` (a fresh subprocess per
-    cycle) benefits too."""
+    cycle) benefits too.
+
+    Pass `cache` to reuse an in-memory cache (watch mode) and
+    `persist=False` to keep it memory-only: watch frames never re-read or
+    rewrite the whole cache for the full history."""
     by_day = defaultdict(make_zero)
     by_model = defaultdict(make_zero)
     by_provider = defaultdict(make_zero)
     by_project = defaultdict(make_zero)   # project = sessions subfolder
     by_session = defaultdict(make_zero)
     by_day_model = defaultdict(lambda: defaultdict(make_zero))  # day -> model -> agg
-    cache = _load_cache()
+    cache = _load_cache() if cache is None else cache
     dirty_dirs = set()  # directories whose shard must be rewritten
     seen = set()
     max_day = None
@@ -452,7 +456,8 @@ def scan():
         dirty_dirs.add(rd)
         del cache[rel]
 
-    _save_shards(cache, dirty_dirs)
+    if persist:
+        _save_shards(cache, dirty_dirs)
     return max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model
 
 
@@ -622,7 +627,9 @@ def to_json(by_model, by_provider, by_project, by_session, today):
 
 def run(args):
     """Read sessions and print the chosen view once."""
-    max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model = scan()
+    watch = args.watch
+    res = scan(cache=getattr(args, "_cache", None), persist=not watch)
+    max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model = res
     today = max_day or datetime.now(timezone.utc).date()
     by_day = {k: v for k, v in by_day.items() if k in last_n_days(60, today)}
 
@@ -739,6 +746,10 @@ def main():
         if args.interval <= 0:
             print("interval must be greater than 0", file=sys.stderr)
             sys.exit(1)
+        # one in-memory cache for the whole watch session: frames update it
+        # in place and never touch the disk cache (no full re-read/rewrite
+        # of the whole history every `-n` seconds).
+        args._cache = _load_cache()
         watch_loop(args)
     else:
         run(args)

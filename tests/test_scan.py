@@ -309,6 +309,20 @@ class CacheTest(unittest.TestCase):
         changed = [n for n, t in mtimes().items() if t != before.get(n)]
         self.assertEqual(len(changed), 1)  # only proj-a's shard, not proj-b's
 
+    def test_watch_reuses_cache_without_disk_writes(self):
+        """Watch mode seeds one in-memory cache and persists nothing: repeated
+        frames neither re-read nor rewrite the whole cache, and a change is
+        only merged into the in-memory dict."""
+        d = date(2026, 8, 17)
+        write_session(self.root, "proj-a", "s1", [line(iso(d))])
+        cache = pi_usage._load_cache()  # seeded once, like main() does
+        pi_usage.scan(cache=cache, persist=False)
+        self.assertEqual(self.cache_files(), [])  # watch wrote nothing
+        write_session(self.root, "proj-a", "s1", [line(iso(d)), line(iso(d, 11))])
+        res = pi_usage.scan(cache=cache, persist=False)  # same dict, still memory-only
+        self.assertEqual(res[1][d.isoformat()]["requests"], 2)
+        self.assertEqual(self.cache_files(), [])
+
     def test_no_cache_env_bypasses_and_writes_nothing(self):
         write_session(self.root, "proj-a", "s1", [line(iso(date(2026, 8, 17)))])
         os.environ["PI_USAGE_NO_CACHE"] = "1"

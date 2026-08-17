@@ -38,8 +38,9 @@ pi-usage --no-color     # No ANSI colors (NO_COLOR is honored too)
 
 Repeated runs are cached, so the live view stays cheap even with a large
 history; `--no-cache` forces a full re-parse. The cache is sharded per
-project, so a change rewrites only that project's shard instead of the
-whole history.
+project (a change rewrites only that project's shard) and watch mode reuses
+it in memory — `-w` never re-reads or rewrites the whole history per
+frame, so it stays light with very large histories.
 
 ## herdr sidebar
 
