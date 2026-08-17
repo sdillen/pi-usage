@@ -21,6 +21,10 @@ Nutzung:
     pi-usage-herdr --watch 60 Alle 60 s berichten (für Live-Tokens)
     pi-usage-herdr --dry-run  Nur zeigen, was berichtet würde (nichts senden)
     pi-usage-herdr --ttl-ms 300000  Token-TTL (Standard 5 min)
+
+Profitiert vom persistenten Scan-Cache von pi-usage: da `pi-usage --json` je
+Zyklus als frischer Subprozess läuft, wird dank des Platten-Caches nur noch die
+veränderte Session neu gelesen statt der ganzen Historie.
 """
 
 import argparse

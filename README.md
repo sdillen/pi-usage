@@ -48,14 +48,36 @@ pi-usage -s <dir>       # use a different sessions directory
 pi-usage -w             # watch: re-render every 5 s (Ctrl+C to stop)
 pi-usage -w -n 10       # watch with custom interval (e.g. 10 s)
 pi-usage -w today       # watch works with any view
+pi-usage --no-cache     # forget the scan cache and parse everything fresh
 ```
+
+## Scan cache & performance
+
+`scan()` keeps a **persistent mtime/size cache** in `~/.cache/pi-usage/` (one
+file per sessions directory, keyed by the resolved path). Files whose
+`(mtime_ns, size)` are unchanged are not re-read or re-parsed — only their
+pre-aggregated results are merged. With a warm cache an 180 MB / 600-file
+session history is re-scanned in ~30 ms instead of ~0.6 s, which drops watch
+mode from ~12 % to well under 2 % of a CPU core.
+
+The cache lives on disk on purpose: it survives separate processes, so
+`pi-usage-herdr` — which spawns a fresh `pi-usage --json` subprocess per cycle —
+benefits too (a full herdr cycle drops from ~0.7 s to ~0.12 s). Deletions,
+renames, new files and size changes (even with an unchanged `mtime`) are all
+detected automatically; only an identical `(mtime_ns, size)` is trusted.
+
+Set `PI_USAGE_NO_CACHE=1` or pass `--no-cache` to force a full parse (e.g. to
+cross-check output, or in read-only environments). The cache is optional — if
+it can't be written, scans simply run cold.
 
 Environment:
 
-| Variable        | Effect                                        |
-|-----------------|-----------------------------------------------|
-| `PI_SESSIONS_DIR` | Default sessions directory (default `~/.pi/agent/sessions`) |
-| `NO_COLOR`        | Disable ANSI colors                          |
+| Variable          | Effect                                        |
+|-------------------|-----------------------------------------------|
+| `PI_SESSIONS_DIR`   | Default sessions directory (default `~/.pi/agent/sessions`) |
+| `NO_COLOR`          | Disable ANSI colors                          |
+| `XDG_CACHE_HOME`    | Cache base dir (default `~/.cache`)          |
+| `PI_USAGE_NO_CACHE` | Bypass the scan cache (full parse, like `--no-cache`) |
 
 ## herdr integration
 

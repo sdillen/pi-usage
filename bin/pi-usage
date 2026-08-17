@@ -25,6 +25,7 @@ Nutzung:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -203,88 +204,225 @@ def section(title):
     return phead(title)
 
 
-def scan():
-    """Stream durch alle JSONL-Sessions; liefert dicts von Aggregaten.
+CACHE_VERSION = 1
 
-    Struktur (eine JSON-Line pro Record):
+
+def _cache_file():
+    """Pfad des persistenten Scan-Cache (je Sessions-Verzeichnis ein File)."""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "pi-usage"
+    key = str(SESSIONS_DIR.resolve())
+    name = "sessions-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] + ".json"
+    return base / name
+
+
+def _parse_file(fp, session_id, project):
+    """Parst EINE JSONL-Session und liefert (max_day, parts).
+
+    parts ist eine Liste von (dimension, key, agg)-Tupeln über alle sechs
+    Aggregat-Dimensionen (day / model / day_model / provider / project /
+    session) – dieselbe Logik wie bisher global in scan(), nur pro Datei
+    vorkumuliert, damit das Ergebnis später via merge() beliebig kombiniert
+    werden kann. Liefert None, wenn die Datei nicht lesbar ist.
+
+    Record-Schema (eine JSON-Line pro Record):
       type=message, message.role=assistant
       message.usage = {input, output, cacheRead, cacheWrite, reasoning?,
                        totalTokens, cost:{input, output, cacheRead, cacheWrite, total}}
       message.model, message.provider
     Datum aus r["timestamp"] (ISO UTC) bzw. message.timestamp (ms)."""
+    try:
+        fh = open(fp, encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    p_day = defaultdict(make_zero)
+    p_model = defaultdict(make_zero)
+    p_provider = defaultdict(make_zero)
+    p_project = defaultdict(make_zero)
+    p_session = defaultdict(make_zero)
+    p_day_model = defaultdict(lambda: defaultdict(make_zero))  # Tag -> Modell -> Agg
+    max_day = None
+    with fh:
+        for line in fh:
+            if '"usage"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = rec.get("message")
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            usage = msg.get("usage")
+            if not isinstance(usage, dict):
+                continue
+
+            # Zeitstempel
+            ts = rec.get("timestamp") or msg.get("timestamp")
+            key = "undated"
+            if isinstance(ts, str):
+                try:
+                    day = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+                    key = day.isoformat()
+                except ValueError:
+                    pass
+            elif isinstance(ts, (int, float)):
+                day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date()
+                key = day.isoformat()
+            if key != "undated" and (max_day is None or day > max_day):
+                max_day = day
+
+            agg = make_zero()
+            cost = usage.get("cost") or {}
+            agg["input"] = usage.get("input", 0)
+            agg["output"] = usage.get("output", 0)
+            agg["cacheRead"] = usage.get("cacheRead", 0)
+            agg["cacheWrite"] = usage.get("cacheWrite", 0)
+            agg["reasoning"] = usage.get("reasoning", 0)
+            agg["tokens"] = usage.get("totalTokens", agg["input"] + agg["output"])
+            for k in COST_KEYS:
+                agg["cost"][k] = cost.get(k, 0.0) or 0.0
+            agg["requests"] = 1
+            agg["sessions"].add(session_id)
+
+            model = msg.get("model") or "unknown"
+            merge(p_day[key], agg)
+            merge(p_model[model], agg)
+            if key != "undated":
+                merge(p_day_model[key][model], agg)
+            merge(p_provider[msg.get("provider") or "unknown"], agg)
+            merge(p_project[project], agg)
+            merge(p_session[session_id], agg)
+
+    parts = []
+    parts += [("day", k, a) for k, a in p_day.items()]
+    parts += [("model", k, a) for k, a in p_model.items()]
+    parts += [("day_model", "%s\x00%s" % (k, m), a)
+              for k, dm in p_day_model.items() for m, a in dm.items()]
+    parts += [("provider", k, a) for k, a in p_provider.items()]
+    parts += [("project", k, a) for k, a in p_project.items()]
+    parts += [("session", k, a) for k, a in p_session.items()]
+    return max_day, parts
+
+
+def _cache_jsonable(entry):
+    """Cache-Eintrag -> JSON-tauglich (Sets -> Listen, date -> ISO-Str)."""
+    return {
+        "sig": entry["sig"],
+        "max_day": entry["max_day"].isoformat() if entry["max_day"] else None,
+        "parts": [[d, k, {**dict(a), "cost": dict(a["cost"]),
+                           "sessions": sorted(a["sessions"])}]
+                   for d, k, a in entry["parts"]],
+    }
+
+
+def _cache_pythonic(entry):
+    """JSON-Cache-Eintrag -> Python-Form (Listen -> Sets, ISO-Str -> date)."""
+    md = entry.get("max_day")
+    parts = []
+    for dim, key, agg in entry["parts"]:
+        a = dict(agg)
+        a["cost"] = dict(agg.get("cost") or {})
+        a["sessions"] = set(agg.get("sessions") or [])
+        parts.append((dim, key, a))
+    return {
+        "sig": entry["sig"],
+        "max_day": datetime.fromisoformat(md).date() if md else None,
+        "parts": parts,
+    }
+
+
+def _load_cache():
+    """Cache von Platte lesen; {} bei Fehler oder falscher Herkunft."""
+    if os.environ.get("PI_USAGE_NO_CACHE"):
+        return {}
+    try:
+        data = json.loads(_cache_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if data.get("version") != CACHE_VERSION or data.get("sessions_dir") != str(SESSIONS_DIR.resolve()):
+        return {}
+    return {rel: _cache_pythonic(e) for rel, e in (data.get("files") or {}).items()}
+
+
+def _save_cache(cache):
+    """Cache atomar auf Platte schreiben (optional – Fehler fallen still durch)."""
+    if os.environ.get("PI_USAGE_NO_CACHE"):
+        return
+    path = _cache_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blob = json.dumps({"version": CACHE_VERSION,
+                           "sessions_dir": str(SESSIONS_DIR.resolve()),
+                           "files": {rel: _cache_jsonable(e) for rel, e in cache.items()}})
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(blob, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # Cache ist optional – Segen, kein Fluch
+
+
+def scan():
+    """Aggregation über alle JSONL-Sessions; liefert
+    (max_day, by_day, by_model, by_provider, by_project, by_session,
+    by_day_model).
+
+    Nutzt einen persistenten mtime/size-Cache (~/.cache/pi-usage/): Dateien,
+    deren (mtime_ns, size) unverändert sind, werden nicht erneut gelesen und
+    geparst, sondern ihre voraggregierten parts direkt übernommen. Der Cache
+    liegt auf Platte und überlebt mehrere Prozesse – damit profitiert auch
+    `pi-usage-herdr` (frischer Subprozess je Zyklus) davon."""
     by_day = defaultdict(make_zero)
     by_model = defaultdict(make_zero)
     by_provider = defaultdict(make_zero)
     by_project = defaultdict(make_zero)   # Projekt = Sessions-Unterordner
     by_session = defaultdict(make_zero)
     by_day_model = defaultdict(lambda: defaultdict(make_zero))  # Tag -> Modell -> Agg
+    cache = _load_cache()
+    new_cache = {}
     max_day = None
 
     for dirpath, _, files in os.walk(SESSIONS_DIR):
         if not files:
             continue
         project = Path(dirpath).name
+        rel_dir = Path(dirpath).relative_to(SESSIONS_DIR)
         for fn in sorted(files):
             if not fn.endswith(".jsonl"):
                 continue
             session_id = fn[:-6]
+            rel = (rel_dir / fn).as_posix()
             fp = Path(dirpath) / fn
             try:
-                fh = open(fp, encoding="utf-8", errors="replace")
+                st = fp.stat()
             except OSError:
                 continue
-            with fh:
-                for line in fh:
-                    if '"usage"' not in line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg = rec.get("message")
-                    if not isinstance(msg, dict) or msg.get("role") != "assistant":
-                        continue
-                    usage = msg.get("usage")
-                    if not isinstance(usage, dict):
-                        continue
-
-                    # Zeitstempel
-                    ts = rec.get("timestamp") or msg.get("timestamp")
-                    key = "undated"
-                    if isinstance(ts, str):
-                        try:
-                            day = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
-                            key = day.isoformat()
-                        except ValueError:
-                            pass
-                    elif isinstance(ts, (int, float)):
-                        day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date()
-                        key = day.isoformat()
-                    if key != "undated" and (max_day is None or day > max_day):
-                        max_day = day
-
-                    agg = make_zero()
-                    cost = usage.get("cost") or {}
-                    agg["input"] = usage.get("input", 0)
-                    agg["output"] = usage.get("output", 0)
-                    agg["cacheRead"] = usage.get("cacheRead", 0)
-                    agg["cacheWrite"] = usage.get("cacheWrite", 0)
-                    agg["reasoning"] = usage.get("reasoning", 0)
-                    agg["tokens"] = usage.get("totalTokens", agg["input"] + agg["output"])
-                    for k in COST_KEYS:
-                        agg["cost"][k] = cost.get(k, 0.0) or 0.0
-                    agg["requests"] = 1
-                    agg["sessions"].add(session_id)
-
-                    model = msg.get("model") or "unknown"
+            sig = [st.st_mtime_ns, st.st_size]
+            entry = cache.get(rel)
+            if entry is None or entry["sig"] != sig:
+                res = _parse_file(fp, session_id, project)
+                if res is None:
+                    continue
+                fmax, parts = res
+                entry = {"sig": sig, "max_day": fmax, "parts": parts}
+            new_cache[rel] = entry   # auch unveränderte Dateien behalten
+            for dim, key, agg in entry["parts"]:
+                if dim == "day":
                     merge(by_day[key], agg)
-                    merge(by_model[model], agg)
-                    if key != "undated":
-                        merge(by_day_model[key][model], agg)
-                    merge(by_provider[msg.get("provider") or "unknown"], agg)
-                    merge(by_project[project], agg)
-                    merge(by_session[session_id], agg)
+                elif dim == "model":
+                    merge(by_model[key], agg)
+                elif dim == "day_model":
+                    d, m = key.split("\x00")
+                    merge(by_day_model[d][m], agg)
+                elif dim == "provider":
+                    merge(by_provider[key], agg)
+                elif dim == "project":
+                    merge(by_project[key], agg)
+                elif dim == "session":
+                    merge(by_session[key], agg)
+            if entry["max_day"] and (max_day is None or entry["max_day"] > max_day):
+                max_day = entry["max_day"]
 
+    _save_cache(new_cache)
     return max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model
 
 
@@ -551,10 +689,14 @@ def main():
     ap.add_argument("-n", "--interval", type=float, default=5.0,
                     help="Aktualisierungsintervall in Sekunden (nur mit -w, Default: 5)")
     ap.add_argument("--no-color", action="store_true", help="ANSI-Farben deaktivieren (auch NO_COLOR respektiert)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="Sessions jedes Mal vollständig neu parsen (Scan-Cache ignorieren)")
     args = ap.parse_args()
 
     if args.no_color:
         USE_COLOR = False
+    if args.no_cache:
+        os.environ["PI_USAGE_NO_CACHE"] = "1"
 
     global SESSIONS_DIR
     if args.sessions_dir:
