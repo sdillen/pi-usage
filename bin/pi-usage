@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+pi-usage — Token- & Kosten-Auswertung für pi (Coding-Agent).
+
+Liest die JSONL-Sessions unter ~/.pi/agent/sessions/ und aggregiert pro
+Modell, Provider, Projekt, Tag und Session. Keine Abhängigkeiten, kein
+SQLite, kein Web-UI. Die Kosten kommen direkt aus den Session-Logs (pi
+schreibt pro Assistant-Reply `usage.cost.total` mit).
+
+Der Output ist im vesper-Stil von pi eingefärbt (Pfirsich/Mint/Teal) und
+zeigt u. a. eine gestapelte Kosten-Bar (input / output / cache) für heute.
+
+Nutzung:
+    pi-usage                # Kompakte Übersicht (Today + 7 Tage + Gesamt)
+    pi-usage today          # Heute (mit Kosten-Bar)
+    pi-usage week           # Letzte 7 Tage (pro Tag + pro Modell)
+    pi-usage stats          # Gesamt nach Modell, Provider, Projekt
+    pi-usage sessions       # Pro Session, nach Verbrauch sortiert
+    pi-usage --extended     # zusätzlich reasoning-/cache-Tokens zeigen
+    pi-usage --json         # rohe Aggregat-Daten als JSON ausgeben
+    pi-usage --no-color     # ANSI-Farben deaktivieren (oder NO_COLOR)
+    pi-usage -w             # Watch: alle 5 Sekunden aktualisieren (Strg+C beendet)
+    pi-usage -w -n 10       # Watch mit eigenem Intervall (z. B. 10 Sekunden)
+    pi-usage -w today       # Watch funktioniert mit jeder Ansicht
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SESSIONS_DIR = Path(os.environ.get("PI_SESSIONS_DIR", Path.home() / ".pi" / "agent" / "sessions"))
+
+AGG_KEYS = ["input", "output", "cacheRead", "cacheWrite", "reasoning", "tokens"]
+COST_KEYS = ["input", "output", "cacheRead", "cacheWrite", "total"]
+
+# ---- Vesper-Farben (pi-Theme des Users) ----
+PANEL = "#1A1A1A"
+SURFACE = "#232323"
+SURFACE1 = "#282828"
+OVERLAY0 = "#5C5C5C"
+TEXT = "#FFFFFF"
+SUBTEXT = "#A0A0A0"
+ACCENT = "#FFC799"    # peach – input
+MINT = "#99FFE4"      # success – output
+CACHE = "#7AA2F7"     # blau – cache (klar unterscheidbar)
+TEAL = "#66DDCC"      # Text-Farbe cR/cW
+RED = "#FF8080"
+
+
+def _tty():
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+USE_COLOR = not os.environ.get("NO_COLOR") and _tty()
+
+
+def _fg(hexs):
+    h = hexs.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"38;2;{r};{g};{b}"
+
+
+def _bg(hexs):
+    h = hexs.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"48;2;{r};{g};{b}"
+
+
+def col(code, s):
+    return f"\x1b[{code}m{s}\x1b[0m" if USE_COLOR else str(s)
+
+
+def ptext(s):   return col(_fg(TEXT), s)
+def psub(s):    return col(_fg(SUBTEXT), s)
+def pdim(s):    return col(_fg(OVERLAY0), s)
+def pacc(s):    return col(_fg(ACCENT), s)
+def pmint(s):   return col(_fg(MINT), s)
+def pteal(s):   return col(_fg(TEAL), s)
+def pred(s):    return col(_fg(RED), s)
+def pbold(s):   return col("1", s)
+def phead(s):   return pacc(pbold(s))
+
+
+def make_zero():
+    a = dict.fromkeys(AGG_KEYS, 0)
+    a["cost"] = dict.fromkeys(COST_KEYS, 0.0)
+    a["requests"] = 0
+    a["sessions"] = set()
+    return a
+
+
+def merge(target, other):
+    for k in AGG_KEYS:
+        target[k] += other[k]
+    for k in COST_KEYS:
+        target["cost"][k] += other["cost"][k]
+    target["requests"] += other["requests"]
+    target["sessions"] |= other["sessions"]
+    return target
+
+
+def fmt_tokens(n):
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(int(n))
+
+
+def fmt_cost(c, extended):
+    if extended:
+        return f"${c:,.4f}"
+    if 0 < c < 0.01:
+        # sub-Cent-Beträge aufrunden statt als $0.00 oder $0.0038 anzeigen
+        return "$0.01"
+    return f"${c:,.2f}"
+
+
+def term_width():
+    try:
+        cols = shutil.get_terminal_size().columns
+    except Exception:
+        cols = 80
+    return max(cols, 40)
+
+
+def cost_parts(a):
+    """Preis-Anteile für die Bar: (label, kosten, farbe), absteigend sortiert."""
+    c = a["cost"]
+    cache = (c.get("cacheRead", 0) or 0) + (c.get("cacheWrite", 0) or 0)
+    parts = [
+        ("input",  c.get("input", 0) or 0.0, ACCENT),
+        ("output", c.get("output", 0) or 0.0, MINT),
+        ("cache",  cache, CACHE),
+    ]
+    parts = [p for p in parts if p[1] > 0]
+    # feste Reihenfolge: input, output, cache (nicht nach Kosten sortieren)
+    return parts
+
+
+def _bar_alloc(parts, total, width):
+    """Verteilt `width` Blöcke proportional auf die Segmente (größte-Reste).
+    Liefert Liste von (name, farbe, anzahl)."""
+    if not total or not parts:
+        return [(p[0], p[2], 0) for p in parts]
+    n = len(parts)
+    shares = [p[1] / total * width for p in parts]
+    counts = [int(s) for s in shares]
+    used = sum(counts)
+    rem = max(0, width - used)
+    order = sorted(range(n), key=lambda i: shares[i] - counts[i], reverse=True)
+    for i in order[:rem]:
+        counts[i] += 1
+    return [(parts[i][0], parts[i][2], counts[i]) for i in range(n)]
+
+
+def _bar_line(parts, total, width):
+    """Eine Zeile fester Blöcke ohne Lücken. Ist wirklich kein Preis
+    vorhanden (0), bleibt die Bar transparent (leere Zellen ohne
+    Hintergrund/Farbe)."""
+    if not parts or total is None or total <= 0:
+        return " " * width
+    segs = _bar_alloc(parts, total, width)
+    cells = []
+    for _name, color, cnt in segs:
+        if cnt:
+            cells.append(col(_fg(color), "█") * cnt)
+    return "".join(cells)
+
+
+def cost_bar(a, width=None, extended=False, label=None):
+    """Segmentierte Bar: wie viel input / output / cache preislich ausmachen."""
+    total = a["cost"]["total"]
+    parts = cost_parts(a)
+    if width is None:
+        width = min(term_width() - 12, 34)
+        width = max(width, 10)
+    if label is None:
+        label = "Kosten heute" if total else "Kosten"
+    lines = [phead(label)]
+    lines.append(" " + _bar_line(parts, total, width) + " ")
+    if parts:
+        for name, cost, color in parts:
+            pct = cost / total * 100
+            lines.append("  " + col(_fg(color), "█") + " "
+                         + psub(f"{name:<8}") + psub(f"{pct:5.1f}%")
+                         + "  " + pacc(pbold(fmt_cost(cost, extended))))
+        lines.append("  " + psub(f"{'Summe':<9}") + pmint(pbold(fmt_cost(total, extended))))
+    else:
+        lines.append("  " + pdim("(noch keine Kosten)"))
+    return "\n".join(lines)
+
+
+def section(title):
+    return phead(title)
+
+
+def scan():
+    """Stream durch alle JSONL-Sessions; liefert dicts von Aggregaten.
+
+    Struktur (eine JSON-Line pro Record):
+      type=message, message.role=assistant
+      message.usage = {input, output, cacheRead, cacheWrite, reasoning?,
+                       totalTokens, cost:{input, output, cacheRead, cacheWrite, total}}
+      message.model, message.provider
+    Datum aus r["timestamp"] (ISO UTC) bzw. message.timestamp (ms)."""
+    by_day = defaultdict(make_zero)
+    by_model = defaultdict(make_zero)
+    by_provider = defaultdict(make_zero)
+    by_project = defaultdict(make_zero)   # Projekt = Sessions-Unterordner
+    by_session = defaultdict(make_zero)
+    by_day_model = defaultdict(lambda: defaultdict(make_zero))  # Tag -> Modell -> Agg
+    max_day = None
+
+    for dirpath, _, files in os.walk(SESSIONS_DIR):
+        if not files:
+            continue
+        project = Path(dirpath).name
+        for fn in sorted(files):
+            if not fn.endswith(".jsonl"):
+                continue
+            session_id = fn[:-6]
+            fp = Path(dirpath) / fn
+            try:
+                fh = open(fp, encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = rec.get("message")
+                    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                        continue
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+
+                    # Zeitstempel
+                    ts = rec.get("timestamp") or msg.get("timestamp")
+                    key = "undated"
+                    if isinstance(ts, str):
+                        try:
+                            day = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+                            key = day.isoformat()
+                        except ValueError:
+                            pass
+                    elif isinstance(ts, (int, float)):
+                        day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date()
+                        key = day.isoformat()
+                    if key != "undated" and (max_day is None or day > max_day):
+                        max_day = day
+
+                    agg = make_zero()
+                    cost = usage.get("cost") or {}
+                    agg["input"] = usage.get("input", 0)
+                    agg["output"] = usage.get("output", 0)
+                    agg["cacheRead"] = usage.get("cacheRead", 0)
+                    agg["cacheWrite"] = usage.get("cacheWrite", 0)
+                    agg["reasoning"] = usage.get("reasoning", 0)
+                    agg["tokens"] = usage.get("totalTokens", agg["input"] + agg["output"])
+                    for k in COST_KEYS:
+                        agg["cost"][k] = cost.get(k, 0.0) or 0.0
+                    agg["requests"] = 1
+                    agg["sessions"].add(session_id)
+
+                    model = msg.get("model") or "unknown"
+                    merge(by_day[key], agg)
+                    merge(by_model[model], agg)
+                    if key != "undated":
+                        merge(by_day_model[key][model], agg)
+                    merge(by_provider[msg.get("provider") or "unknown"], agg)
+                    merge(by_project[project], agg)
+                    merge(by_session[session_id], agg)
+
+    return max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model
+
+
+def last_n_days(n, today):
+    if today is None:
+        return []
+    return [(today - timedelta(days=i)).isoformat() for i in range(n - 1, -1, -1)]
+
+
+def print_compact(by_day, by_model, today):
+    print(col(_bg(SURFACE), " ") + " " + ptext(pbold("pi usage")) + " " + pdim("Token-& Kosten-Auswertung"))
+    if today is None:
+        print(pred("(keine Sessions gefunden)"))
+        return
+    t = by_day.get(today.isoformat())
+    if t is None:
+        t = make_zero()
+    base = "─" * max(term_width() - 14, 2)
+
+    print()
+    print(section(f"Heute · {pdim(today)}"))
+    if t["cost"]["total"]:
+        print(cost_bar(t, extended=False, label=None))
+    print(f"  {psub(f'{fmt_tokens(t['tokens']):>8}')} {pdim('Tokens')}  "
+          f"{psub(f'{str(t['requests']):>6}')} {pdim('Requests')}  "
+          f"{pmint(pbold(fmt_cost(t['cost']['total'], False)))}")
+    print(pdim("└" + base))
+
+    days = last_n_days(7, today)
+    print()
+    print(section("Letzte 7 Tage "))
+    tot = make_zero()
+    for d in days:
+        a = by_day.get(d, make_zero())
+        merge(tot, a)
+        dtext = f"{d:>12}"  # erst padden, dann einfärben (ANSI zählt bei :>12 mit)
+        dcol = pacc(pbold(dtext)) if d[:10] == today.isoformat() else psub(dtext)
+        mini = _mini_bar(a, width=12)
+        # kompakte Mini-Bar statt voller Box
+        print(f"  {dcol}  {mini}  "
+              f"{psub(f'{fmt_tokens(a['tokens']):>8}')} {pdim('Tok')}  "
+              f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}  "
+              f"{pmint(fmt_cost(a['cost']['total'], False))}")
+    print(f"  {pbold(f"{'Summe':>12}")}  "
+          f"{psub(f'{fmt_tokens(tot['tokens']):>8}')} {pdim('Tok')}  "
+          f"{psub(f'{str(tot['requests']):>6}')} {pdim('Req')}  "
+          f"{pmint(pbold(fmt_cost(tot['cost']['total'], False)))}")
+    print(pdim("└" + base))
+
+    print()
+    print(section("Nach Modell · Gesamt"))
+    for m, a in sorted(by_model.items(), key=lambda kv: -kv[1]["tokens"]):
+        print(f"  {pmint(f'{fmt_cost(a['cost']['total'], False):>10}')}  "
+              f"{psub(f'{fmt_tokens(a['tokens']):>8}')} {pdim('Tok')}  "
+              f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}  {ptext(m)}")
+    print(pdim("└" + base))
+
+
+def _mini_bar(a, width=12):
+    """Reine Farb-Bar ohne Legende (für Zeilen)."""
+    total = a["cost"]["total"]
+    parts = cost_parts(a)
+    return _bar_line(parts, total, width)
+
+
+def print_today(by_day, today, extended):
+    print(col(_bg(SURFACE), " ") + " " + ptext(pbold("pi usage · Heute")) + " " + pdim(str(today)))
+    if today is None:
+        print(pred("(keine Sessions)"))
+        return
+    a = by_day.get(today.isoformat(), make_zero())
+    print()
+    print(phead("Kosten-Breakdown (input / output / cache · preislich)"))
+    print(cost_bar(a, extended=extended))
+    print()
+    _print_row("Gesamt", a, extended, show_sessions=True)
+    print(pdim("└" + "─" * max(term_width() - 14, 2)))
+
+
+def print_week(by_day, by_model, today, extended, by_day_model=None):
+    days = last_n_days(7, today)
+    print(col(_bg(SURFACE), " ") + " " + ptext(pbold("pi usage · Letzte 7 Tage")) + " " + pdim(str(today)))
+    for d in days:
+        a = by_day.get(d, make_zero())
+        print(f"  {psub(f'{d[:10]:>10}')}  {_mini_bar(a, width=14)}  "
+              f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}  "
+              f"{pmint(fmt_cost(a['cost']['total'], extended))}")
+    print()
+    if by_day_model:
+        # Modell-Breakdown nur fürs 7-Tage-Fenster
+        week_models = defaultdict(make_zero)
+        for d in days:
+            for m, a in by_day_model.get(d, {}).items():
+                merge(week_models[m], a)
+        print(section("Nach Modell · 7 Tage"))
+        by_model = week_models
+    else:
+        print(section("Nach Modell · Gesamt"))
+    for m, a in sorted(by_model.items(), key=lambda kv: -kv[1]["tokens"]):
+        _print_row(m, a, extended)
+    print(pdim("└" + "─" * max(term_width() - 14, 2)))
+
+
+def print_stats(by_model, by_provider, by_project, today, extended):
+    print(col(_bg(SURFACE), " ") + " " + ptext(pbold("pi usage · Gesamt"))
+          + " " + pdim(f"Projektionen: {len(by_project)} · heute {today}"))
+    print()
+    print(section("Nach Modell"))
+    for m, a in sorted(by_model.items(), key=lambda kv: -kv[1]["tokens"]):
+        _print_row(m, a, extended, show_sessions=True)
+    print()
+    print(section("Nach Provider"))
+    for p, a in sorted(by_provider.items(), key=lambda kv: -kv[1]["tokens"]):
+        _print_row(p, a, extended)
+    print()
+    print(section("Nach Projekt · Top 15"))
+    for p, a in sorted(by_project.items(), key=lambda kv: -kv[1]["tokens"])[:15]:
+        _print_row(p, a, extended, show_sessions=True)
+    print(pdim("└" + "─" * max(term_width() - 14, 2)))
+
+
+def print_sessions(by_session, today, extended, limit=20):
+    pname = {}
+    for dirpath, _, files in os.walk(SESSIONS_DIR):
+        project = Path(dirpath).name
+        for fn in files:
+            if fn.endswith(".jsonl"):
+                pname[fn[:-6]] = project
+    print(col(_bg(SURFACE), " ") + " " + ptext(pbold("pi usage · Sessions")) + " " + pdim(f"Top {limit}"))
+    for sid, a in sorted(by_session.items(), key=lambda kv: -kv[1]["tokens"])[:limit]:
+        print(f"  {psub(f'{fmt_tokens(a['tokens']):>8}')} {pdim('Tok')}  "
+              f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}  "
+              f"{pmint(fmt_cost(a['cost']['total'], extended))}  "
+              f"{pdim(pname.get(sid, '?'))} :: {ptext(sid[:32])}")
+    print(pdim("└" + "─" * max(term_width() - 14, 2)))
+
+
+def _print_row(label, a, extended, show_sessions=False):
+    # erst kürzen + padden, dann einfärben (ANSI-Codes zählen bei :<38 mit)
+    label_s = label if len(label) <= 38 else label[:37] + "…"
+    parts = [f"  {ptext(f'{label_s:<38}')}"]
+    parts.append(f"{pmint(f'{fmt_cost(a['cost']['total'], extended):>10}')}")
+    parts.append(f"{psub(f'{fmt_tokens(a['tokens']):>8}')} {pdim('Tok')}")
+    parts.append(f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}")
+    if extended:
+        parts.append(f"{ptext('in')} {pacc(f'{fmt_tokens(a['input']):>7}')}")
+        parts.append(f"{ptext('out')} {pmint(f'{fmt_tokens(a['output']):>7}')}")
+        parts.append(f"{ptext('cR')} {pteal(f'{fmt_tokens(a['cacheRead']):>7}')}")
+        parts.append(f"{ptext('cW')} {pteal(f'{fmt_tokens(a['cacheWrite']):>7}')}")
+        if a["reasoning"]:
+            parts.append(f"{ptext('reas')} {psub(f'{fmt_tokens(a['reasoning']):>7}')}")
+    if show_sessions and len(a["sessions"]) > 1:
+        parts.append(pdim(f"({len(a['sessions'])} Sessions)"))
+    print(" ".join(parts))
+
+
+def to_json(by_model, by_provider, by_project, by_session, today):
+    def ser(d):
+        return {k: {**{kk: vv for kk, vv in v.items() if kk != "sessions"},
+                    **{"cost": v["cost"], "sessions": sorted(v["sessions"]) if isinstance(v["sessions"], set) else v["sessions"]}}
+                for k, v in d.items()}
+    out = {"today": today.isoformat() if today else None,
+           "by_model": ser(by_model), "by_provider": ser(by_provider),
+           "by_project": ser(by_project), "by_session": ser(by_session)}
+    print(json.dumps(out, indent=2))
+
+
+def run(args):
+    """Sessions einlesen und die gewählte Ansicht einmal ausgeben."""
+    max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model = scan()
+    today = max_day or datetime.now(timezone.utc).date()
+    by_day = {k: v for k, v in by_day.items() if k in last_n_days(60, today)}
+
+    if args.json:
+        to_json(by_model, by_provider, by_project, by_session, today)
+        return
+
+    if args.cmd == "overview":
+        print_compact(by_day, by_model, today)
+    elif args.cmd == "today":
+        print_today(by_day, today, args.extended)
+    elif args.cmd == "week":
+        print_week(by_day, by_model, today, args.extended, by_day_model)
+    elif args.cmd == "stats":
+        print_stats(by_model, by_provider, by_project, today, args.extended)
+    elif args.cmd == "sessions":
+        print_sessions(by_session, today, args.extended)
+
+
+def _render_to_string(args):
+    """run(args) einmal ausführen und die Ausgabe als String zurückgeben,
+    ohne sie direkt auf stdout zu schreiben."""
+    import io
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        run(args)
+    finally:
+        sys.stdout = old
+    return buf.getvalue()
+
+
+def _redraw(text):
+    """Frame flimmerfrei darstellen: Cursor an den Anfang, jede Zeile
+    überschreiben (Erase-to-EOL entfernt Reste längerer Vor-Zeilen),
+    und alles darunter löschen (auch umgebrochene Reste).
+
+    Es wird nie der ganze Bildschirm geleert – bewusst kein \x1b[2J,
+    damit der User keinen Clear-/Blink-Effekt wahrnimmt."""
+    lines = text.rstrip("\n").split("\n")
+    bits = ["\x1b[H"]  # Cursor nach Hause, ohne zu leeren
+    for i, line in enumerate(lines):
+        if i:
+            bits.append("\n")
+        bits.append(line)
+        bits.append("\x1b[K")  # Rest der Zeile löschen (alte, längere Zellen)
+    bits.append("\x1b[J")      # alles unterhalb löschen (Reste vom Vor-Frame)
+    return "".join(bits)
+
+
+def _enter_alt():
+    """Alternate-Screen (wie top/btop): Inhalt in separaten Terminal-Puffer
+    legen und Cursor ausblenden. Beim Beenden wird der vorherige
+    Terminalinhalt unangetastet wiederhergestellt."""
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")
+    sys.stdout.flush()
+
+
+def _leave_alt():
+    sys.stdout.write("\x1b[?25h\x1b[?1049l")
+    sys.stdout.flush()
+
+
+def watch_loop(args):
+    tty = sys.stdout.isatty()
+    if tty:
+        _enter_alt()
+    try:
+        while True:
+            if tty:
+                text = _render_to_string(args)
+                sys.stdout.write(_redraw(text))
+                sys.stdout.flush()
+            else:
+                print()  # Trennzeile bei Pipe/Umleitung
+                run(args)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        if tty:
+            _leave_alt()
+        sys.exit(0)
+
+
+def main():
+    global USE_COLOR
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1] if __doc__ else None)
+    ap.add_argument("cmd", nargs="?", default="overview", choices=["overview", "today", "week", "stats", "sessions"])
+    ap.add_argument("-e", "--extended", action="store_true", help="input/output/cache-Tokens je Zeile zeigen")
+    ap.add_argument("-j", "--json", action="store_true", help="Rohdaten als JSON ausgeben")
+    ap.add_argument("-s", "--sessions-dir", default=None, help="anderes Sessions-Verzeichnis")
+    ap.add_argument("-w", "--watch", action="store_true",
+                    help="Watch-Modus: flimmerfrei neu rendern, ohne sichtbares Clear (Strg+C beendet)")
+    ap.add_argument("-n", "--interval", type=float, default=5.0,
+                    help="Aktualisierungsintervall in Sekunden (nur mit -w, Default: 5)")
+    ap.add_argument("--no-color", action="store_true", help="ANSI-Farben deaktivieren (auch NO_COLOR respektiert)")
+    args = ap.parse_args()
+
+    if args.no_color:
+        USE_COLOR = False
+
+    global SESSIONS_DIR
+    if args.sessions_dir:
+        SESSIONS_DIR = Path(args.sessions_dir)
+    if not SESSIONS_DIR.is_dir():
+        print(f"Sessions-Verzeichnis nicht gefunden: {SESSIONS_DIR}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.watch:
+        if args.interval <= 0:
+            print("Intervall muss größer als 0 sein", file=sys.stderr)
+            sys.exit(1)
+        watch_loop(args)
+    else:
+        run(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+pi-usage-herdr — zeigt pi-Usage in der herdr-Sidebar (Spaces + Agents).
+
+Mappt die pi-Usage-Aggregate (aus `pi-usage --json`) auf herdr-Workspaces
+(Spaces-Panel) und herdr-Panes (Agents-Panel) und meldet sie als
+Sidebar-Metadaten-Tokens:
+
+    herdr workspace report-metadata <w> --source pi-usage --token cost=...
+    herdr pane     report-metadata <p> --source pi-usage --token cost=...
+
+In der config.toml die `$cost`/`$tokens`-Token in die Rows aufnehmen:
+
+    [ui.sidebar.spaces]
+    rows = [["state_icon", "workspace"], ["branch", "git_status", "$cost", "$tokens"]]
+    [ui.sidebar.agents]
+    rows = [["state_icon", "workspace", "tab"], ["agent", "$cost", "$tokens"]]
+
+Nutzung:
+    pi-usage-herdr            Einmal berichten und beenden
+    pi-usage-herdr --watch 60 Alle 60 s berichten (für Live-Tokens)
+    pi-usage-herdr --dry-run  Nur zeigen, was berichtet würde (nichts senden)
+    pi-usage-herdr --ttl-ms 300000  Token-TTL (Standard 5 min)
+"""
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERDR = shutil.which("herdr") or "herdr"
+# Fallback nur für den Fall, dass ~/.bin (per home-manager im PATH) fehlt.
+PI_USAGE = shutil.which("pi-usage") or str(Path.home() / ".bin" / "pi-usage")
+SOURCE = "pi-usage"
+
+CLEANUPS = {"--clear-token": ["tokens", "cost"]}
+
+def run_herdr(*args, dry_run=False, log=True):
+    cmd = [HERDR, *args]
+    if dry_run:
+        print("[dry-run] " + " ".join(cmd))
+        return True
+    if log:
+        print(">> " + " ".join(cmd))
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        print("!! timeout:", " ".join(cmd))
+        return False
+    if p.returncode != 0:
+        print("!! herdr failed (%s): %s" % (p.returncode, (p.stderr or p.stdout).strip()[:300]))
+        return False
+    return True
+
+def get_snapshot():
+    p = subprocess.run([HERDR, "api", "snapshot"], capture_output=True, text=True, timeout=20)
+    if p.returncode != 0:
+        raise RuntimeError("herdr api snapshot failed: " + (p.stderr or p.stdout)[:300])
+    return json.loads(p.stdout)["result"]["snapshot"]
+
+def get_usage():
+    p = subprocess.run([PI_USAGE, "--json"], capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        raise RuntimeError("pi-usage failed: " + (p.stderr or p.stdout)[:300])
+    d = json.loads(p.stdout)
+    return d.get("by_project", {}), d.get("by_session", {})
+
+def encode_project(cwd):
+    """cwd -> pi-Session-Ordnername (z. B. /Users/x -> --Users-x--)."""
+    if not cwd:
+        return None
+    return "--" + cwd.lstrip("/").replace("/", "-") + "--"
+
+def session_id_from_path(path):
+    """.../dir/<session>.jsonl -> <session>"""
+    if not path:
+        return None
+    base = path.rsplit("/", 1)[-1]
+    return base[:-6] if base.endswith(".jsonl") else None
+
+def fmt_tokens(n):
+    if n >= 1_000_000_000:
+        return "%.1fB" % (n / 1e9)
+    if n >= 1_000_000:
+        return "%.1fM" % (n / 1e6)
+    if n >= 1_000:
+        return "%.1fk" % (n / 1e3)
+    return str(int(n))
+
+def fmt_cost(c):
+    return "$%.2f" % c
+
+class Reporter:
+    def __init__(self, dry_run=False, log=True):
+        self.dry_run = dry_run
+        self.log = log
+        self.ok = 0
+        self.fail = 0
+
+    def report_workspace(self, ws_id, tokens, ttl):
+        args = [ws_id, "--source", SOURCE]
+        if tokens:
+            for k, v in tokens.items():
+                args += ["--token", "%s=%s" % (k, v)]
+            args += ["--ttl-ms", str(ttl)]
+        else:
+            for c in CLEANUPS["--clear-token"]:
+                args += ["--clear-token", c]
+            args += ["--ttl-ms", str(ttl)]
+        if run_herdr("workspace", "report-metadata", *args, dry_run=self.dry_run, log=self.log):
+            self.ok += 1
+            return True
+        self.fail += 1
+        return False
+
+    def report_pane(self, pane_id, tokens, ttl):
+        args = [pane_id, "--source", SOURCE]
+        if tokens:
+            for k, v in tokens.items():
+                args += ["--token", "%s=%s" % (k, v)]
+            args += ["--ttl-ms", str(ttl)]
+        else:
+            for c in CLEANUPS["--clear-token"]:
+                args += ["--clear-token", c]
+            args += ["--ttl-ms", str(ttl)]
+        if run_herdr("pane", "report-metadata", *args, dry_run=self.dry_run, log=self.log):
+            self.ok += 1
+            return True
+        self.fail += 1
+        return False
+
+
+def run_cycle(ttl, dry_run, log=True):
+    snap = get_snapshot()
+    by_project, by_session = get_usage()
+    rep = Reporter(dry_run=dry_run, log=log)
+
+    # Workspace -> cwd (aus Panes, Fallback über Agents)
+    ws_cwd = {}
+    for p in snap.get("panes", []):
+        ws = p.get("workspace_id")
+        cwd = p.get("cwd") or p.get("foreground_cwd")
+        if ws and cwd:
+            ws_cwd.setdefault(ws, cwd)
+    for a in snap.get("agents", []):
+        ws = a.get("workspace_id")
+        cwd = a.get("cwd") or a.get("foreground_cwd")
+        if ws and cwd:
+            ws_cwd.setdefault(ws, cwd)
+
+    # Spaces-Panel: Usage des Projekts pro Workspace
+    for ws in snap.get("workspaces", []):
+        ws_id = ws.get("workspace_id")
+        cwd = ws_cwd.get(ws_id)
+        proj = encode_project(cwd)
+        agg = by_project.get(proj) if proj else None
+        if agg:
+            tokens = {
+                "cost": fmt_cost(agg["cost"]["total"]),
+                "tokens": fmt_tokens(agg["tokens"]),
+            }
+        else:
+            tokens = None
+        rep.report_workspace(ws_id, tokens, ttl)
+
+    # Agents-Panel: Usage der laufenden Session pro Pane
+    for a in snap.get("agents", []):
+        pane_id = a.get("pane_id")
+        if not pane_id:
+            continue
+        sess = session_id_from_path((a.get("agent_session") or {}).get("value"))
+        agg = by_session.get(sess) if sess else None
+        if agg:
+            tokens = {
+                "cost": fmt_cost(agg["cost"]["total"]),
+                "tokens": fmt_tokens(agg["tokens"]),
+            }
+        else:
+            tokens = None
+        rep.report_pane(pane_id, tokens, ttl)
+
+    return rep.ok, rep.fail
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--watch", type=int, default=0, metavar="SECONDS",
+                    help="in Schleife laufen (0 = einmalig)")
+    ap.add_argument("--ttl-ms", type=int, default=300_000,
+                    help="TTL der Metadaten-Tokens in ms (max 86400000)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="nur anzeigen, nichts senden")
+    ap.add_argument("--quiet", action="store_true",
+                    help="erfolgreiche report-Befehle nicht ausgeben")
+    args = ap.parse_args()
+
+    if args.dry_run and args.watch:
+        print("--dry-run läuft nur einmal; --watch wird ignoriert.")
+        args.watch = 0
+
+    while True:
+        ok, fail = run_cycle(args.ttl_ms, args.dry_run, log=not args.quiet)
+        print("[pi-usage-herdr] ok=%d fail=%d" % (ok, fail))
+        if args.watch <= 0:
+            return 1 if fail else 0
+        time.sleep(args.watch)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
