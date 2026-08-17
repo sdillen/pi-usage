@@ -203,15 +203,20 @@ def section(title):
     return phead(title)
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
-def _cache_file():
-    """Path of the persistent scan cache (one file per sessions directory)."""
+def _cache_dir():
+    """Cache directory for one sessions directory (shards live inside)."""
     base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "pi-usage"
     key = str(SESSIONS_DIR.resolve())
-    name = "sessions-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] + ".json"
-    return base / name
+    return base / ("sessions-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16])
+
+
+def _shard_path(rel_dir):
+    """Path of the cache shard for one relative directory."""
+    name = "shard-" + hashlib.sha256(rel_dir.encode("utf-8")).hexdigest()[:12] + ".json"
+    return _cache_dir() / name
 
 
 def _parse_file(fp, session_id, project):
@@ -331,33 +336,48 @@ def _cache_pythonic(entry):
 
 
 def _load_cache():
-    """Read cache from disk; {} on error or wrong origin."""
+    """Read all cache shards from disk; {} on error or wrong origin."""
     if os.environ.get("PI_USAGE_NO_CACHE"):
         return {}
+    cache = {}
     try:
-        data = json.loads(_cache_file().read_text(encoding="utf-8"))
+        for p in _cache_dir().glob("*.json"):
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if data.get("version") != CACHE_VERSION:
+                continue
+            rel_dir = data.get("rel_dir", "")
+            for fn, e in (data.get("files") or {}).items():
+                cache[f"{rel_dir}/{fn}" if rel_dir else fn] = _cache_pythonic(e)
     except (OSError, ValueError):
         return {}
-    if data.get("version") != CACHE_VERSION or data.get("sessions_dir") != str(SESSIONS_DIR.resolve()):
-        return {}
-    return {rel: _cache_pythonic(e) for rel, e in (data.get("files") or {}).items()}
+    return cache
 
 
-def _save_cache(cache):
-    """Write cache to disk atomically (optional – errors are silently dropped)."""
-    if os.environ.get("PI_USAGE_NO_CACHE"):
+def _save_shards(cache, rel_dirs):
+    """Write only the cache shards of the changed directories (atomic,
+    errors silently dropped). A single project change rewrites just its own
+    shard, not the whole history."""
+    if os.environ.get("PI_USAGE_NO_CACHE") or not rel_dirs:
         return
-    path = _cache_file()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        blob = json.dumps({"version": CACHE_VERSION,
-                           "sessions_dir": str(SESSIONS_DIR.resolve()),
-                           "files": {rel: _cache_jsonable(e) for rel, e in cache.items()}})
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(blob, encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        pass  # cache is optional — a blessing, not a curse
+    groups = {}
+    for rel, e in cache.items():
+        rd, _, fn = rel.rpartition("/")
+        groups.setdefault(rd, {})[fn] = e
+    for rd in sorted(set(rel_dirs)):
+        entries = groups.get(rd, {})
+        try:
+            path = _shard_path(rd)
+            if not entries:
+                path.unlink(missing_ok=True)  # project vanished -> drop its shard
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            blob = json.dumps({"version": CACHE_VERSION, "rel_dir": rd,
+                               "files": {fn: _cache_jsonable(e) for fn, e in entries.items()}})
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(blob, encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass  # cache is optional — a blessing, not a curse
 
 
 def scan():
@@ -367,9 +387,10 @@ def scan():
 
     Uses a persistent mtime/size cache (~/.cache/pi-usage/): files whose
     (mtime_ns, size) is unchanged are not read and parsed again; their
-    pre-aggregated parts are reused directly. The cache lives on disk and
-    survives multiple processes — so `pi-usage-herdr` (a fresh subprocess
-    per cycle) benefits too."""
+    pre-aggregated parts are reused directly. The cache is sharded per
+    relative directory, so a change rewrites only that project's shard and
+    survives multiple processes — `pi-usage-herdr` (a fresh subprocess per
+    cycle) benefits too."""
     by_day = defaultdict(make_zero)
     by_model = defaultdict(make_zero)
     by_provider = defaultdict(make_zero)
@@ -377,21 +398,22 @@ def scan():
     by_session = defaultdict(make_zero)
     by_day_model = defaultdict(lambda: defaultdict(make_zero))  # day -> model -> agg
     cache = _load_cache()
-    new_cache = {}
-    dirty = False  # only write the cache back when something actually changed
+    dirty_dirs = set()  # directories whose shard must be rewritten
+    seen = set()
     max_day = None
 
     for dirpath, _, files in os.walk(SESSIONS_DIR):
         if not files:
             continue
         project = Path(dirpath).name
-        rel_dir = Path(dirpath).relative_to(SESSIONS_DIR)
+        rel_dir = str(Path(dirpath).relative_to(SESSIONS_DIR))
+        rel_dir = "" if rel_dir == "." else rel_dir
         for fn in sorted(files):
             if not fn.endswith(".jsonl"):
                 continue
             session_id = fn[:-6]
-            rel = (rel_dir / fn).as_posix()
             fp = Path(dirpath) / fn
+            rel = f"{rel_dir}/{fn}" if rel_dir else fn
             try:
                 st = fp.stat()
             except OSError:
@@ -404,8 +426,9 @@ def scan():
                     continue
                 fmax, parts = res
                 entry = {"sig": sig, "max_day": fmax, "parts": parts}
-                dirty = True
-            new_cache[rel] = entry   # keep unchanged files too
+                cache[rel] = entry
+                dirty_dirs.add(rel_dir)
+            seen.add(rel)
             for dim, key, agg in entry["parts"]:
                 if dim == "day":
                     merge(by_day[key], agg)
@@ -423,11 +446,13 @@ def scan():
             if entry["max_day"] and (max_day is None or entry["max_day"] > max_day):
                 max_day = entry["max_day"]
 
-    if len(new_cache) != len(cache):
-        # a deleted/renamed file removed stale keys without a fresh parse
-        dirty = True
-    if dirty:
-        _save_cache(new_cache)
+    # drop cache entries whose files vanished (deleted/renamed)
+    for rel in set(cache) - seen:
+        rd, _, _ = rel.rpartition("/")
+        dirty_dirs.add(rd)
+        del cache[rel]
+
+    _save_shards(cache, dirty_dirs)
     return max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model
 
 

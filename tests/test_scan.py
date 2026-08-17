@@ -202,8 +202,8 @@ class CacheTest(unittest.TestCase):
             os.environ["PI_USAGE_NO_CACHE"] = self._old_nc
         self._tmp.cleanup()
 
-    def cache_file(self):
-        return pi_usage._cache_file()
+    def cache_files(self):
+        return sorted(pi_usage._cache_dir().glob("*.json"))
 
     def test_warm_scan_parses_nothing_new(self):
         d = date(2026, 8, 17)
@@ -287,28 +287,48 @@ class CacheTest(unittest.TestCase):
     def test_cache_persists_to_disk(self):
         write_session(self.root, "proj-a", "s1", [line(iso(date(2026, 8, 17)))])
         pi_usage.scan()
-        path = self.cache_file()
-        self.assertTrue(path.is_file())
-        data = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(data["version"], 1)
-        self.assertIn("proj-a/s1.jsonl", data["files"])
+        shards = self.cache_files()
+        self.assertEqual(len(shards), 1)          # one shard per project dir
+        data = json.loads(shards[0].read_text(encoding="utf-8"))
+        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["rel_dir"], "proj-a")
+        self.assertIn("s1.jsonl", data["files"])
+
+    def test_change_rewrites_only_its_own_shard(self):
+        d = date(2026, 8, 17)
+        write_session(self.root, "proj-a", "s1", [line(iso(d))])
+        write_session(self.root, "proj-b", "s2", [line(iso(d))])
+        pi_usage.scan()
+
+        def mtimes():
+            return {p.name: p.stat().st_mtime_ns for p in self.cache_files()}
+
+        before = mtimes()
+        write_session(self.root, "proj-a", "s1", [line(iso(d)), line(iso(d, 11))])
+        pi_usage.scan()
+        changed = [n for n, t in mtimes().items() if t != before.get(n)]
+        self.assertEqual(len(changed), 1)  # only proj-a's shard, not proj-b's
 
     def test_no_cache_env_bypasses_and_writes_nothing(self):
         write_session(self.root, "proj-a", "s1", [line(iso(date(2026, 8, 17)))])
         os.environ["PI_USAGE_NO_CACHE"] = "1"
         by_day = pi_usage.scan()[1]
         self.assertEqual(by_day["2026-08-17"]["requests"], 1)
-        self.assertFalse(self.cache_file().exists())
+        self.assertEqual(self.cache_files(), [])
 
-    def test_warm_scan_does_not_rewrite_cache_file(self):
-        """A warm scan with nothing changed must not touch the cache on
-        disk (no pointless ~1.5 MB rewrite every cycle while watching)."""
+    def test_warm_scan_does_not_rewrite_shards(self):
+        """A warm scan with nothing changed must not touch any shard on
+        disk (no pointless full rewrite every cycle while watching)."""
         d = date(2026, 8, 17)
         write_session(self.root, "proj-a", "s1", [line(iso(d))])
-        pi_usage.scan()                     # cold: writes the cache
-        before = self.cache_file().stat().st_mtime_ns
+        pi_usage.scan()                     # cold: writes the shards
+
+        def mtimes():
+            return [p.stat().st_mtime_ns for p in self.cache_files()]
+
+        before = mtimes()
         pi_usage.scan()                     # warm: nothing changed
-        self.assertEqual(self.cache_file().stat().st_mtime_ns, before)
+        self.assertEqual(mtimes(), before)
 
     def test_changed_file_rewrites_cache(self):
         """A change still persists to disk — the write is skipped only when
@@ -316,10 +336,11 @@ class CacheTest(unittest.TestCase):
         d = date(2026, 8, 17)
         write_session(self.root, "proj-a", "s1", [line(iso(d))])
         pi_usage.scan()
-        before = self.cache_file().stat().st_mtime_ns
+        before = [p.stat().st_mtime_ns for p in self.cache_files()]
         write_session(self.root, "proj-a", "s1", [line(iso(d)), line(iso(d, 11))])
         pi_usage.scan()
-        self.assertNotEqual(self.cache_file().stat().st_mtime_ns, before)
+        after = [p.stat().st_mtime_ns for p in self.cache_files()]
+        self.assertNotEqual(before, after)
 
 
 class CliJsonTest(unittest.TestCase):
