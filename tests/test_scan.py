@@ -300,6 +300,27 @@ class CacheTest(unittest.TestCase):
         self.assertEqual(by_day["2026-08-17"]["requests"], 1)
         self.assertFalse(self.cache_file().exists())
 
+    def test_warm_scan_does_not_rewrite_cache_file(self):
+        """A warm scan with nothing changed must not touch the cache on
+        disk (no pointless ~1.5 MB rewrite every cycle while watching)."""
+        d = date(2026, 8, 17)
+        write_session(self.root, "proj-a", "s1", [line(iso(d))])
+        pi_usage.scan()                     # cold: writes the cache
+        before = self.cache_file().stat().st_mtime_ns
+        pi_usage.scan()                     # warm: nothing changed
+        self.assertEqual(self.cache_file().stat().st_mtime_ns, before)
+
+    def test_changed_file_rewrites_cache(self):
+        """A change still persists to disk — the write is skipped only when
+        nothing changed, never when something did."""
+        d = date(2026, 8, 17)
+        write_session(self.root, "proj-a", "s1", [line(iso(d))])
+        pi_usage.scan()
+        before = self.cache_file().stat().st_mtime_ns
+        write_session(self.root, "proj-a", "s1", [line(iso(d)), line(iso(d, 11))])
+        pi_usage.scan()
+        self.assertNotEqual(self.cache_file().stat().st_mtime_ns, before)
+
 
 class CliJsonTest(unittest.TestCase):
     def test_json_endpoint(self):

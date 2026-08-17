@@ -378,6 +378,7 @@ def scan():
     by_day_model = defaultdict(lambda: defaultdict(make_zero))  # day -> model -> agg
     cache = _load_cache()
     new_cache = {}
+    dirty = False  # only write the cache back when something actually changed
     max_day = None
 
     for dirpath, _, files in os.walk(SESSIONS_DIR):
@@ -403,6 +404,7 @@ def scan():
                     continue
                 fmax, parts = res
                 entry = {"sig": sig, "max_day": fmax, "parts": parts}
+                dirty = True
             new_cache[rel] = entry   # keep unchanged files too
             for dim, key, agg in entry["parts"]:
                 if dim == "day":
@@ -421,7 +423,11 @@ def scan():
             if entry["max_day"] and (max_day is None or entry["max_day"] > max_day):
                 max_day = entry["max_day"]
 
-    _save_cache(new_cache)
+    if len(new_cache) != len(cache):
+        # a deleted/renamed file removed stale keys without a fresh parse
+        dirty = True
+    if dirty:
+        _save_cache(new_cache)
     return max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model
 
 
