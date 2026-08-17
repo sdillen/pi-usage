@@ -1,7 +1,7 @@
-"""Tests für pi-usage: rein stdlib (unittest + tempfile), keine Dependencies.
+"""Tests for pi-usage: pure stdlib (unittest + tempfile), no dependencies.
 
-Legt synthetische JSONL-Sessions wie ~/.pi/agent/sessions/<projekt>/<id>.jsonl an
-und prüft die Aggregation in pi_usage.scan() sowie den --json-Endpoint via CLI.
+Creates synthetic JSONL sessions like ~/.pi/agent/sessions/<project>/<id>.jsonl
+and checks the aggregation in pi_usage.scan() plus the --json endpoint via CLI.
 """
 import importlib.machinery
 import importlib.util
@@ -17,7 +17,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "bin" / "pi-usage"
 
-# bin/pi-usage hat keine .py-Endung -> expliziter SourceFileLoader
+# bin/pi-usage has no .py extension -> explicit SourceFileLoader
 _loader = importlib.machinery.SourceFileLoader("pi_usage", str(SRC))
 _spec = importlib.util.spec_from_loader("pi_usage", _loader)
 assert _spec is not None and _spec.loader is not None
@@ -67,8 +67,8 @@ def write_session(root, project, session_id, lines):
 
 
 def plain(x):
-    """Verschachtelte defaultdicts/Sets/date in plain Werte überführen
-    (tief) – erlaubt Ergebnisvergleiche unabhängig vom Aggregat-Typ."""
+    """Convert nested defaultdicts/sets/date into plain values (deep) —
+    allows comparing results regardless of the aggregate type."""
     if isinstance(x, dict):
         return {k: plain(v) for k, v in x.items()}
     if isinstance(x, (set, list, tuple)):
@@ -124,7 +124,7 @@ class ScanTest(unittest.TestCase):
         write_session(self.root, "proj-a", "s1", [line(iso(date(2026, 8, 17)))])
         write_session(self.root, "proj-a", "s2", [line(iso(date(2026, 8, 17)))])
         *_, by_project, _, _ = self.scan()
-        # Sessions werden pro Tag dedupliziert gezählt
+        # sessions are counted de-duplicated per day
         self.assertEqual(len(by_project["proj-a"]["sessions"]), 2)
         self.assertEqual(by_project["proj-a"]["requests"], 2)
 
@@ -147,7 +147,7 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(by_day["2026-08-17"]["requests"], 1)
 
     def test_timestamp_integer_ms_fallback(self):
-        # kein rec["timestamp"], dafür message.timestamp in ms
+        # no rec["timestamp"], instead message.timestamp in ms
         ts = int(datetime(2026, 8, 17, 12, tzinfo=timezone.utc).timestamp() * 1000)
         write_session(self.root, "proj-a", "s1", [line(ts)])
         by_day = self.scan()[1]
@@ -176,9 +176,9 @@ class ScanTest(unittest.TestCase):
 
 
 class CacheTest(unittest.TestCase):
-    """Verhalten des persistenten mtime/size-Scan-Cache:
-    warme Scans parsen nichts neu, Änderungen lösen Neuparse aus,
-    und das Ergebnis ist mit einem vollen Neu-Scan identisch."""
+    """Behavior of the persistent mtime/size scan cache:
+    warm scans re-parse nothing, changes trigger a re-parse,
+    and the result is identical to a full fresh scan."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -233,7 +233,7 @@ class CacheTest(unittest.TestCase):
         d = date(2026, 8, 17)
         write_session(self.root, "proj-a", "s1", [line(iso(d, 9))])
         pi_usage.scan()
-        # zweite Zeile anhängen -> mtime+size ändern sich -> Neuparse
+        # append a second line -> mtime+size change -> re-parse
         write_session(self.root, "proj-a", "s1", [
             line(iso(d, 9)),
             line(iso(d, 10), model="gpt-4o-mini", provider="openai"),
@@ -248,8 +248,8 @@ class CacheTest(unittest.TestCase):
         write_session(self.root, "proj-a", "s1", [line(iso(d))])
         st1 = fp.stat()
         pi_usage.scan()
-        # Inhalt ändern, aber mtime künstlich auf den alten Wert zurücksetzen:
-        # nur die Größe verrät die Änderung -> (mtime_ns, size)-Signatur greift.
+        # change the content but artificially reset mtime to the old value:
+        # only the size reveals the change -> the (mtime_ns, size) signature catches it.
         write_session(self.root, "proj-a", "s1", [line(iso(d)), line(iso(d, 11))])
         os.utime(fp, ns=(st1.st_atime_ns, st1.st_mtime_ns))
         by_day = pi_usage.scan()[1]

@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-pi-usage-herdr — zeigt pi-Usage in der herdr-Sidebar (Spaces + Agents).
+pi-usage-herdr — shows pi-usage in the herdr sidebar (Spaces + Agents).
 
-Mappt die pi-Usage-Aggregate (aus `pi-usage --json`) auf herdr-Workspaces
-(Spaces-Panel) und herdr-Panes (Agents-Panel) und meldet sie als
-Sidebar-Metadaten-Tokens:
+Maps the pi-usage aggregates (from `pi-usage --json`) to herdr workspaces
+(Spaces panel) and herdr panes (Agents panel) and reports them as
+sidebar metadata tokens:
 
     herdr workspace report-metadata <w> --source pi-usage --token cost=...
     herdr pane     report-metadata <p> --source pi-usage --token cost=...
 
-In der config.toml die `$cost`/`$tokens`-Token in die Rows aufnehmen:
+Add the `$cost`/`$tokens` tokens to the rows in your config.toml:
 
     [ui.sidebar.spaces]
     rows = [["state_icon", "workspace"], ["branch", "git_status", "$cost", "$tokens"]]
     [ui.sidebar.agents]
     rows = [["state_icon", "workspace", "tab"], ["agent", "$cost", "$tokens"]]
 
-Nutzung:
-    pi-usage-herdr            Einmal berichten und beenden
-    pi-usage-herdr --watch 60 Alle 60 s berichten (für Live-Tokens)
-    pi-usage-herdr --dry-run  Nur zeigen, was berichtet würde (nichts senden)
-    pi-usage-herdr --ttl-ms 300000  Token-TTL (Standard 5 min)
+Usage:
+    pi-usage-herdr            Report once and exit
+    pi-usage-herdr --watch 60 Report every 60 s (for live tokens)
+    pi-usage-herdr --dry-run  Only show what would be reported (send nothing)
+    pi-usage-herdr --ttl-ms 300000  Token TTL (default 5 min)
 
-Profitiert vom persistenten Scan-Cache von pi-usage: da `pi-usage --json` je
-Zyklus als frischer Subprozess läuft, wird dank des Platten-Caches nur noch die
-veränderte Session neu gelesen statt der ganzen Historie.
+Benefits from pi-usage's persistent scan cache: since `pi-usage --json` runs
+as a fresh subprocess each cycle, only the changed session is re-read thanks
+to the on-disk cache instead of the whole history.
 """
 
 import argparse
@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 
 HERDR = shutil.which("herdr") or "herdr"
-# Fallback nur für den Fall, dass ~/.bin (per home-manager im PATH) fehlt.
+# Fallback only in case ~/.bin (on PATH via home-manager) is missing.
 PI_USAGE = shutil.which("pi-usage") or str(Path.home() / ".bin" / "pi-usage")
 SOURCE = "pi-usage"
 
@@ -142,7 +142,7 @@ def run_cycle(ttl, dry_run, log=True):
     by_project, by_session = get_usage()
     rep = Reporter(dry_run=dry_run, log=log)
 
-    # Workspace -> cwd (aus Panes, Fallback über Agents)
+    # Workspace -> cwd (from panes, fallback via agents)
     ws_cwd = {}
     for p in snap.get("panes", []):
         ws = p.get("workspace_id")
@@ -170,7 +170,7 @@ def run_cycle(ttl, dry_run, log=True):
             tokens = None
         rep.report_workspace(ws_id, tokens, ttl)
 
-    # Agents-Panel: Usage der laufenden Session pro Pane
+    # Agents panel: usage of the running session per pane
     for a in snap.get("agents", []):
         pane_id = a.get("pane_id")
         if not pane_id:
@@ -192,17 +192,17 @@ def run_cycle(ttl, dry_run, log=True):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--watch", type=int, default=0, metavar="SECONDS",
-                    help="in Schleife laufen (0 = einmalig)")
+                    help="run in a loop (0 = run once)")
     ap.add_argument("--ttl-ms", type=int, default=300_000,
-                    help="TTL der Metadaten-Tokens in ms (max 86400000)")
+                    help="TTL of the metadata tokens in ms (max 86400000)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="nur anzeigen, nichts senden")
+                    help="only show what would be reported, send nothing")
     ap.add_argument("--quiet", action="store_true",
-                    help="erfolgreiche report-Befehle nicht ausgeben")
+                    help="do not print successful report commands")
     args = ap.parse_args()
 
     if args.dry_run and args.watch:
-        print("--dry-run läuft nur einmal; --watch wird ignoriert.")
+        print("--dry-run runs only once; --watch is ignored.")
         args.watch = 0
 
     while True:
