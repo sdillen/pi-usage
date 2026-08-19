@@ -47,6 +47,8 @@ frame, so it stays light with very large histories.
 `pi-usage-herdr` mirrors usage into [herdr](https://github.com) sidebars — cost
 and tokens per workspace (Spaces panel) and per pane (Agents panel):
 
+![pi-usage in the herdr sidebar](docs/screenshot-herdr.png)
+
 ```
 pi-usage-herdr             Report once and exit
 pi-usage-herdr --watch 60  Keep reporting every 60 s (live tokens)
