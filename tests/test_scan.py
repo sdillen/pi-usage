@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -355,6 +355,44 @@ class CacheTest(unittest.TestCase):
         pi_usage.scan()
         after = [p.stat().st_mtime_ns for p in self.cache_files()]
         self.assertNotEqual(before, after)
+
+
+class CliMonthOverviewTest(unittest.TestCase):
+    """The overview groups costs per calendar month (last 3, English names)."""
+
+    def run_cli(self, root, *args):
+        env = dict(os.environ)
+        env["PI_USAGE_NO_CACHE"] = "1"   # CLI-Test nie auf den realen Cache zugreifen
+        p = subprocess.run([sys.executable, str(SRC), *args, "-s", str(root)],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout
+
+    def test_overview_lists_one_row_per_month(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            today = date(2026, 8, 17)
+            write_session(root, "proj-a", "s1", [line(iso(today))])
+            write_session(root, "proj-a", "s2", [line(iso(date(2026, 7, 5)))])
+            write_session(root, "proj-a", "s3", [line(iso(date(2026, 6, 3)))])
+            write_session(root, "proj-a", "s4", [line(iso(date(2026, 5, 20)))])  # excluded
+            out = self.run_cli(root)  # default overview
+            for name in ("June", "July", "August"):
+                self.assertIn(name, out)         # one row per month, English names
+            self.assertNotIn("May", out)        # older than 3 months excluded
+            self.assertIn("Last 3 months", out) # summary row still present
+
+    def test_overview_shows_last_3_months_total(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            today = date(2026, 8, 17)
+            old_m = date(2026, 5, 20)
+            write_session(root, "proj-a", "s1", [line(iso(today))])
+            write_session(root, "proj-a", "s2", [line(iso(old_m))])
+            out = self.run_cli(root)  # default overview
+            self.assertIn("Last 3 months", out)
+            # old session (3 months back) not in the 3-month total
+            self.assertNotIn(pi_usage.fmt_cost(2 * 0.0165), out)
 
 
 class CliJsonTest(unittest.TestCase):

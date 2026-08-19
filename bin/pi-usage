@@ -11,7 +11,7 @@ The output is colored in pi's vesper style (peach/mint/teal) and shows
 among others a stacked cost bar (input / output / cache) for today.
 
 Usage:
-    pi-usage                # Compact overview (today + 7 days + totals)
+    pi-usage                # Compact overview (today + 7 days + 3-month totals)
     pi-usage today          # Today (with cost bar)
     pi-usage week           # Last 7 days (per day + per model)
     pi-usage stats          # Totals by model, provider, project
@@ -116,7 +116,7 @@ def fmt_tokens(n):
     return str(int(n))
 
 
-def fmt_cost(c, extended):
+def fmt_cost(c, extended=False):
     if extended:
         return f"${c:,.4f}"
     if 0 < c < 0.01:
@@ -468,11 +468,45 @@ def last_n_days(n, today):
 
 
 def _week_models(by_day_model, today):
+    """Aggregate per model across the last 7 days."""
     out = defaultdict(make_zero)
     for d in last_n_days(7, today):
         for m, a in by_day_model.get(d, {}).items():
             merge(out[m], a)
     return out
+
+
+def last_n_months(n, today):
+    """'YYYY-MM' keys for the last n calendar months (current month last)."""
+    y, m = today.year, today.month
+    out = []
+    for i in range(n - 1, -1, -1):
+        idx = y * 12 + (m - 1) - i
+        yy, mm = divmod(idx, 12)
+        out.append(f"{yy:04d}-{mm + 1:02d}")
+    return out
+
+
+_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"]
+
+
+def _month_label(m):
+    """'YYYY-MM' -> English month name, e.g. '2026-08' -> 'August'."""
+    return _MONTH_NAMES[int(m[5:7]) - 1]
+
+
+def _months_rollup(by_day, months):
+    """Sum per calendar month; returns (per_month, total agg)."""
+    mset = set(months)
+    per = defaultdict(make_zero)
+    tot = make_zero()
+    for d, a in by_day.items():
+        m = d[:7] if len(d) == 10 else None
+        if m in mset:
+            merge(per[m], a)
+            merge(tot, a)
+    return per, tot
 
 
 def print_compact(by_day, today, by_day_model):
@@ -513,6 +547,21 @@ def print_compact(by_day, today, by_day_model):
           f"{psub(f'{fmt_tokens(tot['tokens']):>8}')} {pdim('Tok')}  "
           f"{psub(f'{str(tot['requests']):>6}')} {pdim('Req')}  "
           f"{pmint(pbold(fmt_cost(tot['cost']['total'], False)))}")
+
+    # Months — one row per calendar month over the last 3, plus a summary
+    # row for the whole window.
+    months = last_n_months(3, today)
+    per3, tot3 = _months_rollup(by_day, months)
+    for m in months:
+        a = per3[m]
+        print(f"  {psub(f'{_month_label(m):>12}')}  {_mini_bar(a, width=12)}  "
+              f"{psub(f'{fmt_tokens(a['tokens']):>8}')} {pdim('Tok')}  "
+              f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}  "
+              f"{pmint(fmt_cost(a['cost']['total'], False))}")
+    print(f"  {pmint(pbold(f"{'Last 3 months':>12}"))}  "
+          f"{psub(f'{fmt_tokens(tot3['tokens']):>8}')} {pdim('Tok')}  "
+          f"{psub(f'{str(tot3['requests']):>6}')} {pdim('Req')}  "
+          f"{pmint(pbold(fmt_cost(tot3['cost']['total'], False)))}")
     print(pdim("└" + base))
 
     print()
@@ -634,7 +683,9 @@ def run(args):
     res = scan(cache=getattr(args, "_cache", None), persist=not watch)
     max_day, by_day, by_model, by_provider, by_project, by_session, by_day_model = res
     today = max_day or datetime.now(timezone.utc).date()
-    by_day = {k: v for k, v in by_day.items() if k in last_n_days(60, today)}
+    # keep 120 days: covers the last 3 full calendar months for the
+    # overview (the oldest day needed can be ~92 days back)
+    by_day = {k: v for k, v in by_day.items() if k in last_n_days(120, today)}
 
     if args.json:
         to_json(by_model, by_provider, by_project, by_session, today)
@@ -720,7 +771,8 @@ def watch_loop(args):
 def main():
     global USE_COLOR
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1] if __doc__ else None)
-    ap.add_argument("cmd", nargs="?", default="overview", choices=["overview", "today", "week", "stats", "sessions"])
+    ap.add_argument("cmd", nargs="?", default="overview",
+                    choices=["overview", "today", "week", "stats", "sessions"])
     ap.add_argument("-e", "--extended", action="store_true", help="show input/output/cache tokens per row")
     ap.add_argument("-j", "--json", action="store_true", help="output raw data as JSON")
     ap.add_argument("-s", "--sessions-dir", default=None, help="use a different sessions directory")
