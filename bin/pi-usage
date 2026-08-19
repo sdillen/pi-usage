@@ -467,7 +467,15 @@ def last_n_days(n, today):
     return [(today - timedelta(days=i)).isoformat() for i in range(n - 1, -1, -1)]
 
 
-def print_compact(by_day, by_model, today):
+def _week_models(by_day_model, today):
+    out = defaultdict(make_zero)
+    for d in last_n_days(7, today):
+        for m, a in by_day_model.get(d, {}).items():
+            merge(out[m], a)
+    return out
+
+
+def print_compact(by_day, today, by_day_model):
     print(col(_bg(SURFACE), " ") + " " + ptext(pbold("pi usage")) + " " + pdim("Token & cost analytics"))
     if today is None:
         print(pred("(no sessions found)"))
@@ -508,8 +516,10 @@ def print_compact(by_day, by_model, today):
     print(pdim("└" + base))
 
     print()
-    print(section("By model · Total"))
-    for m, a in sorted(by_model.items(), key=lambda kv: -kv[1]["tokens"]):
+    # model breakdown only for the 7-day window
+    week_models = _week_models(by_day_model, today)
+    print(section("By model · 7 days"))
+    for m, a in sorted(week_models.items(), key=lambda kv: -kv[1]["tokens"]):
         print(f"  {pmint(f'{fmt_cost(a['cost']['total'], False):>10}')}  "
               f"{psub(f'{fmt_tokens(a['tokens']):>8}')} {pdim('Tok')}  "
               f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}  {ptext(m)}")
@@ -537,7 +547,7 @@ def print_today(by_day, today, extended):
     print(pdim("└" + "─" * max(term_width() - 14, 2)))
 
 
-def print_week(by_day, by_model, today, extended, by_day_model=None):
+def print_week(by_day, today, extended, by_day_model):
     days = last_n_days(7, today)
     print(col(_bg(SURFACE), " ") + " " + ptext(pbold("pi usage · Last 7 days")) + " " + pdim(str(today)))
     for d in days:
@@ -546,17 +556,10 @@ def print_week(by_day, by_model, today, extended, by_day_model=None):
               f"{psub(f'{str(a['requests']):>6}')} {pdim('Req')}  "
               f"{pmint(fmt_cost(a['cost']['total'], extended))}")
     print()
-    if by_day_model:
-        # model breakdown only for the 7-day window
-        week_models = defaultdict(make_zero)
-        for d in days:
-            for m, a in by_day_model.get(d, {}).items():
-                merge(week_models[m], a)
-        print(section("By model · 7 days"))
-        by_model = week_models
-    else:
-        print(section("By model · Total"))
-    for m, a in sorted(by_model.items(), key=lambda kv: -kv[1]["tokens"]):
+    # model breakdown only for the 7-day window
+    week_models = _week_models(by_day_model, today)
+    print(section("By model · 7 days"))
+    for m, a in sorted(week_models.items(), key=lambda kv: -kv[1]["tokens"]):
         _print_row(m, a, extended)
     print(pdim("└" + "─" * max(term_width() - 14, 2)))
 
@@ -638,11 +641,11 @@ def run(args):
         return
 
     if args.cmd == "overview":
-        print_compact(by_day, by_model, today)
+        print_compact(by_day, today, by_day_model)
     elif args.cmd == "today":
         print_today(by_day, today, args.extended)
     elif args.cmd == "week":
-        print_week(by_day, by_model, today, args.extended, by_day_model)
+        print_week(by_day, today, args.extended, by_day_model)
     elif args.cmd == "stats":
         print_stats(by_model, by_provider, by_project, today, args.extended)
     elif args.cmd == "sessions":
