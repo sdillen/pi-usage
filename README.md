@@ -6,6 +6,8 @@ session logs under `~/.pi/agent/sessions/`. Zero dependencies, no setup.
 `-w` keeps the numbers live without eating your CPU, and an optional companion
 mirrors them into the herdr sidebar.
 
+![pi-usage — Terminal overview and herdr sidebar](docs/screenshot-herdr.png)
+
 Works with any Python ≥ 3.8 (stdlib only).
 
 ## Install
@@ -46,9 +48,6 @@ frame, so it stays light with very large histories.
 
 `pi-usage-herdr` mirrors usage into [herdr](https://github.com) sidebars — cost
 and tokens per workspace (Spaces panel) and per pane (Agents panel):
-
-![pi-usage in the herdr sidebar](docs/screenshot-herdr.png)
-
 ```
 pi-usage-herdr             Report once and exit
 pi-usage-herdr --watch 60  Keep reporting every 60 s (live tokens)
