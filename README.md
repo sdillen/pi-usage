@@ -25,7 +25,7 @@ Done.
 ## Usage
 
 ```
-pi-usage                # Overview: today + last 7 days + totals
+pi-usage                # Overview: today + last 7 days + last 3 months
 pi-usage today          # Today, with a cost bar (input / output / cache)
 pi-usage week           # Last 7 days, per day and per model
 pi-usage stats          # Totals by model, provider and project
